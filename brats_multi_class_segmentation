@@ -1,0 +1,794 @@
+https://colab.research.google.com/drive/1n-sIkLX1qUKFxUOlm4-2BmJLcUtBB16q?usp=sharing
+
+!pip install tensorboardX
+
+!pip install nibabel
+
+import tensorflow as tf
+from tensorflow import summary
+import datetime,json
+import string
+
+%load_ext tensorboard
+current_time=str(datetime.datetime.now().timestamp())
+train_log_dir='logs/tensorboard/train'+current_time
+test_log_dir='logs/tensorboard/test'+current_time
+train_summary_writer=summary.create_file_writer(train_log_dir)
+test_summary_writer=summary.create_file_writer(test_log_dir)
+
+'''
+@tf.function
+def my_func(step,loss):
+  with train_summary_writer.as_default():
+    tf.summary.scalar("loss",loss,step)
+'''
+
+from google.colab import drive
+drive.mount('/content/gdrive')
+
+folder_path_fully='/content/gdrive/My Drive/Brats2018/HGG'
+test_path_fully='/content/gdrive/My Drive/Brats2018/HGG_test'
+
+#folder_path_under='/content/gdrive/My Drive/Dataset_MRI/Under'
+
+import os
+from scipy.ndimage import zoom  # For resizing
+subfolders=[os.path.join(folder_path_fully,folder) for folder in os.listdir(folder_path_fully) ]
+
+print(subfolders)
+
+
+def read_input_paths(subfolder):
+    folder=subfolder.split("/", -1)[-1]
+    flair=subfolder.split("/", -1)[-1]+'_flair.nii'
+    #seg=subfolder.split("/", -1)[-1]+'_seg.nii'
+    t1=subfolder.split("/", -1)[-1]+'_t1.nii'
+    t1ce=subfolder.split("/", -1)[-1]+'_t1ce.nii'
+    t2=subfolder.split("/", -1)[-1]+'_t2.nii'
+    flair=os.path.join(subfolder,flair)
+    #seg=os.path.join(subfolder,seg)
+    t1=os.path.join(subfolder,t1)
+    t1ce=os.path.join(subfolder,t1ce)
+    t2=os.path.join(subfolder,t2)
+    return [flair,t1,t1ce,t2]
+def read_label_paths(subfolder):
+  seg=subfolder.split("/", -1)[-1]+'_seg.nii'
+  seg=os.path.join(subfolder,seg)
+  return seg
+def convert_onech_tomultichannelgt(seg_img):
+  final_gt=[]
+  seg_test1=seg_img.copy()
+  seg_test2=seg_img.copy()
+  seg_test3=seg_img.copy()
+  seg_test4=seg_img.copy()
+  
+  seg_test1=np.where((seg_test1>0.0)&(seg_test1<=1.0), 1, 0)
+  seg_test2=np.where((seg_test2>1.0)&(seg_test2<=2.0), 1, 0)
+  seg_test3=np.where((seg_test3>2.0)&(seg_test3<=3.0), 1, 0)
+  seg_test4=np.where((seg_test4>3.0)&(seg_test4<=4.0), 1, 0)
+  seg_test2_3=seg_test2+seg_test3
+  seg_list=[seg_test1,seg_test2,seg_test3,seg_test4]
+  for segment in seg_list:
+    final_gt.append(segment)
+  return np.asarray(final_gt)
+def normalize(x):
+    """
+        argument
+            - x: input image data in numpy array [32, 32, 3]
+        return
+            - normalized x 
+    """
+    #min_val = np.min(x)
+    max_val = np.max(x)
+    x = x / (max_val+1e-10)
+    return x
+
+input_paths=[read_input_paths(subfolder)  for subfolder in subfolders]
+label_paths=[read_label_paths(subfolder)  for subfolder in subfolders]
+
+
+print(input_paths[0:2])
+print(label_paths[0:2])
+
+
+
+
+import numpy as np
+import nibabel as nib
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+#import torch_geometric.nn as pyg_nn
+#import torch_geometric.utils as pyg_utils
+
+import time
+from datetime import datetime
+
+#import networkx as nx
+import numpy as np
+import torch
+import torch.optim as optim
+#from torchvision.datasets import MNIST
+import multiprocessing
+
+import numpy as np
+import scipy as sp
+from skimage.segmentation import slic, mark_boundaries
+import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+NP_TORCH_FLOAT_DTYPE = np.float32
+NP_TORCH_LONG_DTYPE = np.int64
+
+
+import torch
+#import networkx as nx
+
+%matplotlib inline
+
+'''
+def dice_loss(input, target):
+    """ This is a normal dice loss function for binary segmentation.
+    Args:
+        input: output of the segmentation network
+        target: ground truth label
+    Returns:
+        dice score
+    """
+    smooth = 1
+    #input = F.softmax(input, dim=1)
+    # input = torch.sigmoid(input) #for binary
+    iflat = input.view(-1)
+    tflat = target.view(-1)
+    intersection = (iflat * tflat).sum()
+    union = iflat.sum() + tflat.sum()
+    dice_score = (2.*intersection + smooth)/(union + smooth)
+    return 1-dice_score
+'''
+class BinaryDiceLoss(nn.Module):
+    """Dice loss of binary class
+    Args:
+        smooth: A float number to smooth loss, and avoid NaN error, default: 1
+        p: Denominator value: \sum{x^p} + \sum{y^p}, default: 2
+        predict: A tensor of shape [N, *]
+        target: A tensor of shape same with predict
+        reduction: Reduction method to apply, return mean over batch if 'mean',
+            return sum if 'sum', return a tensor of shape [N,] if 'none'
+    Returns:
+        Loss tensor according to arg reduction
+    Raise:
+        Exception if unexpected reduction
+    """
+    def __init__(self, smooth=1, p=2, reduction='mean'):
+        super(BinaryDiceLoss, self).__init__()
+        self.smooth = smooth
+        self.p = p
+        self.reduction = reduction
+
+    def forward(self, predict, target):
+        assert predict.shape[0] == target.shape[0], "predict & target batch size don't match"
+        predict=F.softmax(predict, dim=1)
+        predict = predict.contiguous().view(predict.shape[0], -1)
+        target = target.contiguous().view(target.shape[0], -1)
+
+        num = torch.sum(torch.mul(predict, target), dim=1) + self.smooth
+        den = torch.sum(predict.pow(self.p) + target.pow(self.p), dim=1) + self.smooth
+
+        loss = 1 - num / den
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        elif self.reduction == 'none':
+            return loss
+        else:
+            raise Exception('Unexpected reduction {}'.format(self.reduction))
+
+
+class DiceLoss(nn.Module):
+    """Dice loss, need one hot encode input
+    Args:
+        weight: An array of shape [num_classes,]
+        ignore_index: class index to ignore
+        predict: A tensor of shape [N, C, *]
+        target: A tensor of same shape with predict
+        other args pass to BinaryDiceLoss
+    Return:
+        same as BinaryDiceLoss
+    """
+    def __init__(self, weight=None, ignore_index=None, **kwargs):
+        super(DiceLoss, self).__init__()
+        self.kwargs = kwargs
+        self.weight = weight
+        self.ignore_index = ignore_index
+        self.dice = BinaryDiceLoss(**self.kwargs)
+
+    def forward(self, predict, target):
+        assert predict.shape == target.shape, 'predict & target shape do not match'
+
+        total_loss = 0
+        for i in range(target.shape[1]):
+            if i != self.ignore_index:
+                dice_loss = dice(predict[:, i], target[:, i])
+                if self.weight is not None:
+                    assert self.weight.shape[0] == target.shape[1], \
+                        'Expect weight shape [{}], get[{}]'.format(target.shape[1], self.weight.shape[0])
+                    dice_loss *= self.weights[i]
+                total_loss += dice_loss
+
+        return total_loss/target.shape[1]
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+#import torch_geometric.nn as pyg_nn
+#import torch_geometric.utils as pyg_utils
+
+import time
+from datetime import datetime
+
+#import networkx as nx
+import numpy as np
+import torch
+import torch.optim as optim
+#from torchvision.datasets import MNIST
+import multiprocessing
+
+import numpy as np
+import scipy as sp
+from skimage.segmentation import slic, mark_boundaries
+import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+NP_TORCH_FLOAT_DTYPE = np.float32
+NP_TORCH_LONG_DTYPE = np.int64
+
+
+import torch
+#import networkx as nx
+
+%matplotlib inline
+
+from tensorboardX import SummaryWriter
+writer = SummaryWriter(logdir='/content/runs')
+%load_ext tensorboard
+
+from torch.utils.data import Dataset
+from torchvision import transforms
+data_transform = transforms.Compose([
+        
+        transforms.Normalize(mean=[0.5, 0.5, 0.5,0.5],
+                             std=[0.5, 0.5, 0.5,0.5])
+    ])
+class BRATSDataset2D(Dataset):
+
+    def __init__(self, root_path, transform=None):
+        subfolders=[os.path.join(root_path,folder) for folder in os.listdir(root_path) ]
+        input_paths=[read_input_paths(subfolder)  for subfolder in subfolders]
+        label_paths=[read_label_paths(subfolder)  for subfolder in subfolders]
+
+        self.datastore = []
+        for inps,lbl in zip(input_paths,label_paths):
+          im_inps=np.asarray([nib.load(x).get_fdata() for x in inps])
+          for i in range(im_inps.shape[-1]):
+            slc = im_inps[...,i]
+            if slc.min() == 0 and slc.max() == 0:
+              continue
+            datum = (inps, lbl, i)
+            self.datastore.append(datum)
+
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.datastore)
+
+    def __getitem__(self, idx):
+      datum = self.datastore[idx]
+      im_inps=np.asarray([nib.load(x).dataobj[...,datum[2]] for x in datum[0]])
+      seg_inps=nib.load(datum[1]).dataobj[...,datum[2]]
+      seg_inps=convert_onech_tomultichannelgt(seg_inps)
+      im_inps=normalize(im_inps)
+      im_inps=torch.tensor(im_inps)
+      seg_inps=torch.tensor(seg_inps)
+      #im_inps=data_transform(im_inps)
+      return im_inps, seg_inps 
+
+class BRATSDataset3D(Dataset):
+
+    def __init__(self, root_path, transform=None):
+        subfolders=[os.path.join(root_path,folder) for folder in os.listdir(root_path) ]
+        self.input_paths=[read_input_paths(subfolder)  for subfolder in subfolders]
+        self.label_paths=[read_label_paths(subfolder)  for subfolder in subfolders]
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.label_paths)
+
+    def __getitem__(self, idx):
+      inps = self.input_paths[idx]
+      lbl = self.label_paths[idx]
+      im_inps=np.asarray([nib.load(x).get_fdata() for x in inps])
+      seg_inps=nib.load(lbl).get_fdata()
+      seg_inps=convert_onech_tomultichannelgt(seg_inps)
+
+      im_inps = im_inps.transpose(0,3,1,2)
+      seg_inps = seg_inps.transpose(0,3,1,2)
+
+      return normalize(im_inps), seg_inps 
+
+import pdb
+import torch
+import torch.nn as nn
+
+from torch.nn.functional import softmax
+
+
+import torch.nn as nn
+import torch
+'''
+from core.modules import (
+    ResidualConv,
+    ASPP,
+    AttentionBlock,
+    Upsample_,
+    Squeeze_Excite_Block,
+)
+'''
+import torch.nn as nn
+import torch
+
+
+class ResidualConv(nn.Module):
+    def __init__(self, input_dim, output_dim, stride, padding):
+        super(ResidualConv, self).__init__()
+
+        self.conv_block = nn.Sequential(
+            nn.BatchNorm2d(input_dim),
+            nn.ReLU(),
+            nn.Conv2d(
+                input_dim, output_dim, kernel_size=3, stride=stride, padding=padding
+            ),
+            nn.BatchNorm2d(output_dim),
+            nn.ReLU(),
+            nn.Conv2d(output_dim, output_dim, kernel_size=3, padding=1),
+        )
+        self.conv_skip = nn.Sequential(
+            nn.Conv2d(input_dim, output_dim, kernel_size=3, stride=stride, padding=1),
+            nn.BatchNorm2d(output_dim),
+        )
+
+    def forward(self, x):
+
+        return self.conv_block(x) + self.conv_skip(x)
+
+
+class Upsample(nn.Module):
+    def __init__(self, input_dim, output_dim, kernel, stride):
+        super(Upsample, self).__init__()
+
+        self.upsample = nn.ConvTranspose2d(
+            input_dim, output_dim, kernel_size=kernel, stride=stride
+        )
+
+    def forward(self, x):
+        return self.upsample(x)
+
+
+class Squeeze_Excite_Block(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(Squeeze_Excite_Block, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class ASPP(nn.Module):
+    def __init__(self, in_dims, out_dims, rate=[6, 12, 18]):
+        super(ASPP, self).__init__()
+
+        self.aspp_block1 = nn.Sequential(
+            nn.Conv2d(
+                in_dims, out_dims, 3, stride=1, padding=rate[0], dilation=rate[0]
+            ),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(out_dims),
+        )
+        self.aspp_block2 = nn.Sequential(
+            nn.Conv2d(
+                in_dims, out_dims, 3, stride=1, padding=rate[1], dilation=rate[1]
+            ),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(out_dims),
+        )
+        self.aspp_block3 = nn.Sequential(
+            nn.Conv2d(
+                in_dims, out_dims, 3, stride=1, padding=rate[2], dilation=rate[2]
+            ),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(out_dims),
+        )
+
+        self.output = nn.Conv2d(len(rate) * out_dims, out_dims, 1)
+        self._init_weights()
+
+    def forward(self, x):
+        x1 = self.aspp_block1(x)
+        x2 = self.aspp_block2(x)
+        x3 = self.aspp_block3(x)
+        out = torch.cat([x1, x2, x3], dim=1)
+        return self.output(out)
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+
+class Upsample_(nn.Module):
+    def __init__(self, scale=2):
+        super(Upsample_, self).__init__()
+
+        self.upsample = nn.Upsample(mode="bilinear", scale_factor=scale)
+
+    def forward(self, x):
+        return self.upsample(x)
+
+
+class AttentionBlock(nn.Module):
+    def __init__(self, input_encoder, input_decoder, output_dim):
+        super(AttentionBlock, self).__init__()
+
+        self.conv_encoder = nn.Sequential(
+            nn.BatchNorm2d(input_encoder),
+            nn.ReLU(),
+            nn.Conv2d(input_encoder, output_dim, 3, padding=1),
+            nn.MaxPool2d(2, 2),
+        )
+
+        self.conv_decoder = nn.Sequential(
+            nn.BatchNorm2d(input_decoder),
+            nn.ReLU(),
+            nn.Conv2d(input_decoder, output_dim, 3, padding=1),
+        )
+
+        self.conv_attn = nn.Sequential(
+            nn.BatchNorm2d(output_dim),
+            nn.ReLU(),
+            nn.Conv2d(output_dim, 1, 1),
+        )
+
+    def forward(self, x1, x2):
+        out = self.conv_encoder(x1) + self.conv_decoder(x2)
+        out = self.conv_attn(out)
+        return out * x2
+
+
+class ResUnet(nn.Module):
+    def __init__(self, channel, filters=[64, 128, 256, 512]):
+        super(ResUnet, self).__init__()
+
+        self.input_layer = nn.Sequential(
+            nn.Conv2d(channel, filters[0], kernel_size=3, padding=1),
+            nn.BatchNorm2d(filters[0]),
+            nn.ReLU(),
+            nn.Conv2d(filters[0], filters[0], kernel_size=3, padding=1),
+        )
+        self.input_skip = nn.Sequential(
+            nn.Conv2d(channel, filters[0], kernel_size=3, padding=1)
+        )
+
+        self.residual_conv_1 = ResidualConv(filters[0], filters[1], 2, 1)
+        self.residual_conv_2 = ResidualConv(filters[1], filters[2], 2, 1)
+
+        self.bridge = ResidualConv(filters[2], filters[3], 2, 1)
+
+        self.upsample_1 = Upsample(filters[3], filters[3], 2, 2)
+        self.up_residual_conv1 = ResidualConv(filters[3] + filters[2], filters[2], 1, 1)
+
+        self.upsample_2 = Upsample(filters[2], filters[2], 2, 2)
+        self.up_residual_conv2 = ResidualConv(filters[2] + filters[1], filters[1], 1, 1)
+
+        self.upsample_3 = Upsample(filters[1], filters[1], 2, 2)
+        self.up_residual_conv3 = ResidualConv(filters[1] + filters[0], filters[0], 1, 1)
+
+        self.output_layer = nn.Sequential(
+            nn.Conv2d(filters[0], 4, 1, 1)
+            
+        )
+
+    def forward(self, x):
+        # Encode
+        x1 = self.input_layer(x) + self.input_skip(x)
+        x2 = self.residual_conv_1(x1)
+        x3 = self.residual_conv_2(x2)
+        # Bridge
+        x4 = self.bridge(x3)
+        # Decode
+        x4 = self.upsample_1(x4)
+        x5 = torch.cat([x4, x3], dim=1)
+
+        x6 = self.up_residual_conv1(x5)
+
+        x6 = self.upsample_2(x6)
+        x7 = torch.cat([x6, x2], dim=1)
+
+        x8 = self.up_residual_conv2(x7)
+
+        x8 = self.upsample_3(x8)
+        x9 = torch.cat([x8, x1], dim=1)
+
+        x10 = self.up_residual_conv3(x9)
+
+        output = self.output_layer(x10)
+
+        return output
+
+
+from torch.utils.data import TensorDataset, DataLoader
+ 
+#model = UNet(class_num=4,useBN=True)
+model=ResUnet(4)
+
+use_cuda = torch.cuda.is_available()
+device = torch.device("cuda:0" )
+
+my_dataset = BRATSDataset2D(root_path=folder_path_fully)
+my_dataloader = DataLoader(my_dataset,batch_size=1, shuffle=True)
+test_dataset = BRATSDataset2D(root_path=test_path_fully)
+test_dataloader = DataLoader(test_dataset,batch_size=1,shuffle=True)
+writer = SummaryWriter()
+
+model.cuda()
+
+optimizer = torch.optim.Adam(model.parameters(), lr=0.00001)
+batch_size=4
+trainingloss=[]
+testloss=[]
+iters=[]
+
+train_input=[]
+test_input=[]
+train_pred=[]
+test_pred=[]
+train_gt=[]
+test_gt=[]
+train_iter_epoch=[]
+test_iter_epoch=[]
+test_losses=[]
+loss_fn=BinaryDiceLoss()
+testloss=BinaryDiceLoss()
+
+for epoch in range(50):
+    # Training
+    
+  for n,(local_batch, local_labels) in enumerate(my_dataloader):
+        losses=[]
+        if torch.min(local_batch) == 0 and torch.max(local_batch) == 0:
+          continue
+    
+        optimizer.zero_grad()
+        #local_batch=data_transform(local_batch)
+        local_batch=local_batch.cuda().float()
+        local_label=local_labels.cuda().float()
+        
+        i = model(local_batch)
+        
+   
+        #loss=dice_loss(i,local_label)
+        #print(i.shape)
+        #print(local_label.shape)
+        loss=loss_fn(i,local_label)
+       
+        loss.backward()
+        optimizer.step()
+        iters.append(n)
+        losses.append((float(loss)))
+  if(epoch>=30):
+    train_iter_epoch.append(epoch)
+    train_input.append(local_batch)
+    train_pred.append(i)
+    train_gt.append(local_label)
+
+
+
+  #for n, (imgs, labels) in enumerate(train_loader):      
+  print('Epoch: {:03d}, Loss: {:.4f}'.format(epoch, torch.mean(torch.FloatTensor(losses))))
+  writer.add_scalar('Loss/train', torch.mean(torch.FloatTensor(losses)), epoch)
+
+    
+  
+  with torch.no_grad():
+        model.eval()
+        
+        test_losses=[]
+        for images,labels in test_dataloader:
+          if torch.min(images) == 0 and torch.max(labels) == 0:
+            continue
+          #images=data_transform(images)
+          images=images.cuda()
+         
+          outputs = model(images.float())
+        
+          #test_loss = dice_loss(outputs.cuda(), labels.cuda())
+          
+          test_loss=testloss(outputs, labels.cuda())
+          test_losses.append(float(test_loss))
+  writer.add_scalar('Loss/test', (torch.mean(torch.FloatTensor(test_losses))).item(), epoch)
+  if(epoch>=30):
+    test_iter_epoch.append(epoch)
+    test_input.append(images)
+    test_pred.append(outputs)
+    test_gt.append(labels)
+         
+                  
+  print('test loss',(torch.mean(torch.FloatTensor(test_losses))).item())
+  
+  writer.close()
+
+
+
+torch.save(model, '/content/gdrive/My Drive/Brats2018/resunet_weights1.pt')
+
+
+
+%tensorboard --logdir /content/runs
+
+#!pip install tensorboard
+
+#%tensorboard --logdir=runs
+
+'''
+plt.plot(np.arange(50),trainingloss,label='Training loss')
+#plt.show()
+#plt.plot(np.arange(50),testloss,label='Test loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.show()
+'''
+'''
+plt.plot(np.arange(100),trainingloss,label='Training loss')
+#plt.show()
+plt.plot(np.arange(100),testloss,label='Test loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.show()
+#test_loss
+'''
+
+
+def plot(ori_imgs, recon_imgs, masked_imgs,masked_imgs1, figsize = (10, 10)):
+    IMG_SIZE=240
+    print()
+    fig, axes = plt.subplots(1, 4, figsize = figsize)
+    fig.subplots_adjust(hspace=0.4, wspace = 0.4, right =0.7)
+    
+    axes[0].imshow(np.reshape(ori_imgs,[IMG_SIZE, IMG_SIZE]), cmap = 'gray')
+    axes[0].set_xlabel('channel 0')
+    axes[0].set_xticks([])
+    axes[0].set_yticks([])
+    
+    axes[1].imshow(np.reshape(recon_imgs,[IMG_SIZE, IMG_SIZE]), cmap = 'gray')
+    axes[1].set_xlabel('channel 2')
+    axes[1].set_xticks([])
+    axes[1].set_yticks([])
+    
+    axes[2].imshow(np.reshape(masked_imgs,[IMG_SIZE, IMG_SIZE]), cmap = 'gray')
+    axes[2].set_xlabel('Channel 3')
+    axes[2].set_xticks([])
+    axes[2].set_yticks([])
+
+    axes[3].imshow(np.reshape(masked_imgs1,[IMG_SIZE, IMG_SIZE]), cmap = 'gray')
+    axes[3].set_xlabel('Channel 4')
+    axes[3].set_xticks([])
+    axes[3].set_yticks([])
+    
+    plt.tight_layout()
+    plt.show()
+
+def plot_pred(ori_imgs, recon_imgs, masked_imgs, figsize = (10, 10)):
+    IMG_SIZE=240
+    print()
+    fig, axes = plt.subplots(1, 3, figsize = figsize)
+    fig.subplots_adjust(hspace=0.4, wspace = 0.4, right =0.7)
+    
+    axes[0].imshow(np.reshape(ori_imgs,[IMG_SIZE, IMG_SIZE]), cmap = 'gray')
+    axes[0].set_xlabel('channel 0')
+    axes[0].set_xticks([])
+    axes[0].set_yticks([])
+    
+    axes[1].imshow(np.reshape(recon_imgs,[IMG_SIZE, IMG_SIZE]), cmap = 'gray')
+    axes[1].set_xlabel('channel 2')
+    axes[1].set_xticks([])
+    axes[1].set_yticks([])
+    
+    axes[2].imshow(np.reshape(masked_imgs,[IMG_SIZE, IMG_SIZE]), cmap = 'gray')
+    axes[2].set_xlabel('Channel 3')
+    axes[2].set_xticks([])
+    axes[2].set_yticks([])
+
+    
+    
+    plt.tight_layout()
+    plt.show()
+
+print(test_input[0].shape)
+
+import numpy as np
+from skimage.filters import threshold_otsu
+for each in range(len(train_iter_epoch)):
+  inptr=train_input[each]
+  predtr=train_pred[each]
+  gttr=train_gt[each]
+  print('input',inptr.shape)
+  print('pred',predtr.shape)
+  print('gt',gttr.shape)
+  inptr=inptr.squeeze().cpu().detach().numpy()g
+  predtr=predtr.squeeze().cpu().detach().numpy()
+  gttr=gttr.squeeze().cpu().detach().numpy()
+  #print(inptr.min())
+  #print(np.min(predtr))
+  #print(np.min(gttr))
+  #thresh1 = threshold_otsu(predtr)
+  predtr[predtr<=0.5] = 0
+  predtr[predtr>0.5] = 1
+  plot(inptr[0],inptr[1],inptr[2],inptr[3])
+  plot(predtr[0],predtr[1],predtr[2],predtr[3])
+  plot(gttr[0],gttr[1],gttr[2],gttr[3])
+
+for each in range(len(test_iter_epoch)):
+  inpt1=test_input[each]
+  predt2=test_pred[each]
+  gtt1=test_gt[each]
+  print('input',inpt1.shape)
+  print('pred',predt2.shape)
+  print('gt',gtt1.shape)
+  inpt1=inpt1.squeeze().cpu().detach().numpy()
+  predt2=predt2.squeeze().cpu().detach().numpy()
+  gtt1=gtt1.squeeze().cpu().detach().numpy()
+  
+  #print(predt1.shape[0])
+  #plot(inpt[0],inpt[1],inpt[2],inpt[3])
+  thresh2 = threshold_otsu(predt2)
+  #thresh2=0.5
+  predt2[predt2<=thresh2] = 0
+  predt2[predt2>thresh2] = 1
+  
+  plot(inpt1[0],inpt1[1],inpt1[2],inpt1[3])
+  plot(predt2[0],predt2[1],predt2[2],predt2[3])
+  plot(gtt1[0],gtt1[1],gtt1[2],gtt1[3])
+  #print(inpt1.shape)
+  #print(predt2.shape)
+  #print(gtt1.shape)
+
+print(len(test_input))
+print(len(test_pred))
+print(len(test_gt))
+
+for each1 in test_pred:
+  print(each1.shape)
